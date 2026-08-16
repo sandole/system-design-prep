@@ -1,69 +1,141 @@
-import Image from "next/image";
+import Link from "next/link";
+import { allCaseStudies, allTopics } from "@/lib/content";
+import { flashcards } from "@/lib/flashcards";
+import { glossary } from "@/lib/glossary";
+import Badge from "@/components/Badge";
+
+const features = [
+  {
+    href: "/topics",
+    title: "Core Topics",
+    description:
+      "Deep dives into every building block: load balancing, caching, sharding, consistency, queues, and more.",
+  },
+  {
+    href: "/case-studies",
+    title: "Case Studies",
+    description:
+      "Classic interview questions solved end to end — requirements, estimation, APIs, data model, deep dives.",
+  },
+  {
+    href: "/framework",
+    title: "Interview Framework",
+    description:
+      "A battle-tested 4-step framework with a minute-by-minute plan for a 45-minute interview.",
+  },
+  {
+    href: "/calculator",
+    title: "Back-of-Envelope Calculator",
+    description:
+      "Turn DAU and usage assumptions into QPS, storage, bandwidth, and cache estimates instantly.",
+  },
+  {
+    href: "/flashcards",
+    title: "Flashcards",
+    description:
+      "Rapid-fire Q&A across all categories to pressure-test your recall before the interview.",
+  },
+  {
+    href: "/glossary",
+    title: "Glossary & Latency Numbers",
+    description:
+      "Every term you might get asked, plus the latency numbers every engineer should know.",
+  },
+];
 
 export default function Home() {
+  const stats = [
+    { value: allTopics.length, label: "core topics" },
+    { value: allCaseStudies.length, label: "case studies" },
+    { value: flashcards.length, label: "flashcards" },
+    { value: glossary.length, label: "glossary terms" },
+  ];
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div>
+      <section className="py-12 text-center">
+        <p className="mb-4 font-mono text-sm text-indigo-400">
+          statically generated · served from the edge · zero servers to melt
+        </p>
+        <h1 className="mx-auto max-w-3xl text-4xl font-bold tracking-tight text-white sm:text-5xl">
+          Everything you need to ace the{" "}
+          <span className="text-indigo-400">system design interview</span>
+        </h1>
+        <p className="mx-auto mt-5 max-w-2xl text-lg text-slate-400">
+          Concept deep dives, fully worked case studies, estimation tools, and
+          drills — in one place, with the tradeoff-driven thinking interviewers
+          actually look for.
+        </p>
+        <div className="mt-8 flex flex-wrap justify-center gap-3">
+          <Link
+            href="/framework"
+            className="rounded-lg bg-indigo-500 px-5 py-2.5 font-medium text-white transition-colors hover:bg-indigo-400"
           >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            Start with the framework
+          </Link>
+          <Link
+            href="/topics"
+            className="rounded-lg border border-slate-700 px-5 py-2.5 font-medium text-slate-200 transition-colors hover:bg-slate-800"
           >
-            Documentation
-          </a>
+            Browse topics
+          </Link>
         </div>
-      </main>
+        <dl className="mx-auto mt-10 grid max-w-2xl grid-cols-2 gap-4 sm:grid-cols-4">
+          {stats.map((s) => (
+            <div key={s.label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+              <dd className="text-2xl font-bold text-white">{s.value}</dd>
+              <dt className="text-sm text-slate-500">{s.label}</dt>
+            </div>
+          ))}
+        </dl>
+      </section>
+
+      <section className="py-10">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {features.map((f) => (
+            <Link
+              key={f.href}
+              href={f.href}
+              className="group rounded-xl border border-slate-800 bg-slate-900/40 p-6 transition-colors hover:border-indigo-500/50 hover:bg-slate-900"
+            >
+              <h2 className="font-semibold text-white group-hover:text-indigo-400">
+                {f.title}
+              </h2>
+              <p className="mt-2 text-sm leading-relaxed text-slate-400">
+                {f.description}
+              </p>
+            </Link>
+          ))}
+        </div>
+      </section>
+
+      <section className="py-10">
+        <div className="mb-6 flex items-baseline justify-between">
+          <h2 className="text-xl font-semibold text-white">
+            Popular case studies
+          </h2>
+          <Link href="/case-studies" className="text-sm text-indigo-400 hover:text-indigo-300">
+            View all →
+          </Link>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {allCaseStudies.slice(0, 6).map((c) => (
+            <Link
+              key={c.slug}
+              href={`/case-studies/${c.slug}`}
+              className="group rounded-xl border border-slate-800 bg-slate-900/40 p-5 transition-colors hover:border-indigo-500/50 hover:bg-slate-900"
+            >
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <h3 className="font-medium text-white group-hover:text-indigo-400">
+                  {c.title}
+                </h3>
+                <Badge label={c.difficulty} />
+              </div>
+              <p className="line-clamp-3 text-sm text-slate-400">{c.summary}</p>
+            </Link>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
