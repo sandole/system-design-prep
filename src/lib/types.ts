@@ -19,6 +19,18 @@ export interface Topic {
 
 export type Difficulty = "Easy" | "Medium" | "Hard";
 
+export interface CodeSketch {
+  title: string;
+  language: string; // e.g. "typescript", "python", "sql"
+  code: string;
+}
+
+export interface RapidImplementation {
+  stack: string; // one-line concrete MVP stack
+  steps: string[]; // ordered build steps for a weekend MVP
+  codeSketches: CodeSketch[]; // core algorithms that make the design work
+}
+
 export interface CaseStudy {
   slug: string;
   title: string;
@@ -34,6 +46,7 @@ export interface CaseStudy {
   bottlenecks: string[];
   keyTakeaways: string[];
   relatedTopics: string[]; // topic slugs
+  rapidImplementation: RapidImplementation;
 }
 
 export interface Flashcard {

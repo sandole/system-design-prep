@@ -18,7 +18,7 @@ export default function CaseStudiesPage() {
       <p className="mt-2 mb-8 max-w-2xl text-slate-400">
         The questions that actually get asked, each worked through the full
         interview arc: requirements → estimation → API → high-level design →
-        deep dives → bottlenecks.
+        deep dives → rapid MVP implementation with real code → bottlenecks.
       </p>
       {order.map((difficulty) => {
         const group = allCaseStudies.filter((c) => c.difficulty === difficulty);

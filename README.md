@@ -5,7 +5,8 @@ Everything you need to ace the system design interview, in one fully static Next
 ## Features
 
 - **25 core topic deep dives** - scalability, load balancing, caching, sharding, replication, consistency & CAP, consistent hashing, message queues, event-driven architecture, distributed transactions, fault tolerance, observability, security, probabilistic data structures, and more
-- **12 classic case studies** worked end to end (requirements → estimation → API → high-level design → data model → deep dives → bottlenecks): URL shortener, rate limiter, news feed, chat, video streaming, web crawler, typeahead, notifications, ride sharing, key-value store, cloud storage, payment system
+- **28 classic case studies** worked end to end (requirements → estimation → API → high-level design → data model → deep dives → rapid implementation → bottlenecks): URL shortener, rate limiter, news feed, chat, video streaming, web crawler, typeahead, notifications, ride sharing, key-value store, cloud storage, payments, Snowflake IDs, distributed cache, Instagram, Google Docs, proximity service, job scheduler, search engine, ticket booking, metrics monitoring, leaderboard, ad click aggregator, message queue, dating app, email, digital wallet, live streaming
+- **Rapid implementation guides** - every case study ends with a "build the MVP in a weekend" recipe: a concrete budget stack, ordered build steps, and the core algorithm in real TypeScript/Python/SQL
 - **Back-of-envelope calculator** - DAU and usage assumptions in, QPS / storage / bandwidth / cache-size estimates out
 - **50 flashcards** with category filtering, shuffle, and known/review tracking
 - **45-minute interview framework** - a four-step arc with timing, scripts, dos and don'ts

@@ -123,6 +123,91 @@ export const caseStudies1: CaseStudy[] = [
       "Keep the redirect path minimal: cache lookup plus redirect; push everything else (analytics, expiry cleanup) off the critical path.",
     ],
     relatedTopics: ["caching", "sharding-and-partitioning", "sql-vs-nosql", "load-balancing", "probabilistic-data-structures"],
+    rapidImplementation: {
+      stack: "Next.js API routes + Postgres + Redis (Upstash free tier) on a $6 VPS or Vercel hobby plan behind Cloudflare",
+      steps: [
+        "Create a urls table: id BIGSERIAL PK, short_code VARCHAR(7) with a UNIQUE index, long_url TEXT, created_at, expires_at NULL.",
+        "Write a base62 encoder that turns the auto-increment id into a short code, offset by a large constant (e.g. 100000000) so codes start at 5-6 chars.",
+        "Build POST /api/urls: validate the URL with the URL constructor, insert the row, encode the returned id, update the row with the code, return short URL.",
+        "Support custom aliases by inserting the alias directly and catching the Postgres 23505 unique-violation error to return 409.",
+        "Build GET /[code]: look up Redis first, fall back to Postgres, SET the code in Redis with a 24h TTL, respond with a 302 redirect.",
+        "Fire-and-forget an INCR on clicks:{code} in Redis on each redirect; flush counts to Postgres with a cron every minute.",
+        "Add a nightly cron that deletes or deactivates rows where expires_at < now().",
+        "Point Cloudflare at the app and enable caching of 404s to blunt enumeration scans.",
+      ],
+      codeSketches: [
+        {
+          title: "Base62 encode from auto-increment id",
+          language: "typescript",
+          code: `const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const OFFSET = 100_000_000n; // avoid tiny 1-2 char codes
+
+export function encodeBase62(id: bigint): string {
+  let n = id + OFFSET;
+  let out = "";
+  while (n > 0n) {
+    out = ALPHABET[Number(n % 62n)] + out;
+    n = n / 62n;
+  }
+  return out;
+}
+
+export function decodeBase62(code: string): bigint {
+  let n = 0n;
+  for (const ch of code) {
+    n = n * 62n + BigInt(ALPHABET.indexOf(ch));
+  }
+  return n - OFFSET;
+}`,
+        },
+        {
+          title: "Create endpoint: insert, encode, retry on alias collision",
+          language: "typescript",
+          code: `async function createShortUrl(longUrl: string, alias?: string) {
+  new URL(longUrl); // throws on invalid input
+  if (alias) {
+    try {
+      await sql(
+        "INSERT INTO urls (short_code, long_url) VALUES ($1, $2)",
+        [alias, longUrl]
+      );
+      return alias;
+    } catch (e: any) {
+      if (e.code === "23505") throw new Error("alias taken"); // 409
+      throw e;
+    }
+  }
+  // id-based codes cannot collide: insert first, derive code from id
+  const rows = await sql(
+    "INSERT INTO urls (short_code, long_url) VALUES ('pending', $1) RETURNING id",
+    [longUrl]
+  );
+  const code = encodeBase62(BigInt(rows[0].id));
+  await sql("UPDATE urls SET short_code = $1 WHERE id = $2", [code, rows[0].id]);
+  return code;
+}`,
+        },
+        {
+          title: "Redirect handler with cache-aside Redis",
+          language: "typescript",
+          code: `export async function GET(req: Request, ctx: { params: { code: string } }) {
+  const { code } = ctx.params;
+  let longUrl = await redis.get("url:" + code);
+  if (!longUrl) {
+    const rows = await sql(
+      "SELECT long_url FROM urls WHERE short_code = $1 AND (expires_at IS NULL OR expires_at > now())",
+      [code]
+    );
+    if (rows.length === 0) return new Response("Not found", { status: 404 });
+    longUrl = rows[0].long_url;
+    await redis.set("url:" + code, longUrl, { ex: 86400 });
+  }
+  redis.incr("clicks:" + code); // not awaited, off the hot path
+  return Response.redirect(longUrl, 302);
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "rate-limiter",
@@ -246,6 +331,92 @@ export const caseStudies1: CaseStudy[] = [
       "Keep the hot path to exactly one network round trip; rules and configuration belong in local caches.",
     ],
     relatedTopics: ["rate-limiting", "caching", "consistent-hashing", "fault-tolerance", "api-design"],
+    rapidImplementation: {
+      stack: "Node.js (Express or Next.js middleware) + a single Redis instance (Upstash free tier or Docker on a $6 VPS)",
+      steps: [
+        "Run Redis locally with docker run -p 6379:6379 redis and connect with ioredis.",
+        "Write the token bucket as a Lua script (refill from elapsed time, decrement, return allowed + remaining) and load it once with redis.defineCommand.",
+        "Store per-key state in a Redis hash rl:{key} with fields tokens and last_refill_ms, and set PEXPIRE to 2x the refill window so idle keys evict themselves.",
+        "Wrap the script call in an Express middleware that builds the key from user id (or req.ip as fallback) plus route, with a 5 ms timeout on the Redis call.",
+        "On deny, respond 429 with X-RateLimit-Limit, X-RateLimit-Remaining, and Retry-After headers computed from the script's return values.",
+        "On Redis timeout or error, fail open: allow the request, apply a small in-process fallback bucket per key, and increment a limiter_degraded metric.",
+        "Keep rules in a rules.json (routePattern, limit, windowSeconds) loaded at boot and hot-reloaded on file change; match longest prefix per request.",
+        "Verify atomicity by hammering one key from two processes with autocannon and asserting admitted count never exceeds the limit.",
+      ],
+      codeSketches: [
+        {
+          title: "Atomic token bucket as a Redis Lua script",
+          language: "typescript",
+          code: `// KEYS[1] = bucket key, ARGV = [capacity, refillPerSec, nowMs, cost]
+export const TOKEN_BUCKET_LUA = [
+  "local capacity = tonumber(ARGV[1])",
+  "local rate = tonumber(ARGV[2])",
+  "local now = tonumber(ARGV[3])",
+  "local cost = tonumber(ARGV[4])",
+  "local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')",
+  "local tokens = tonumber(state[1]) or capacity",
+  "local ts = tonumber(state[2]) or now",
+  "tokens = math.min(capacity, tokens + (now - ts) / 1000 * rate)",
+  "local allowed = 0",
+  "if tokens >= cost then",
+  "  tokens = tokens - cost",
+  "  allowed = 1",
+  "end",
+  "redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)",
+  "redis.call('PEXPIRE', KEYS[1], math.ceil(capacity / rate * 2000))",
+  "return { allowed, tostring(tokens) }",
+].join("\\n");`,
+        },
+        {
+          title: "Express middleware calling the script",
+          language: "typescript",
+          code: `redis.defineCommand("tokenBucket", { numberOfKeys: 1, lua: TOKEN_BUCKET_LUA });
+
+export function rateLimit(limit: number, windowSeconds: number) {
+  const ratePerSec = limit / windowSeconds;
+  return async (req: any, res: any, next: any) => {
+    const key = "rl:" + (req.user?.id ?? req.ip) + ":" + req.path;
+    try {
+      const [allowed, tokens] = await withTimeout(
+        redis.tokenBucket(key, limit, ratePerSec, Date.now(), 1),
+        5 // ms budget; fail open past this
+      );
+      res.set("X-RateLimit-Limit", String(limit));
+      res.set("X-RateLimit-Remaining", String(Math.floor(Number(tokens))));
+      if (allowed === 1) return next();
+      const retryMs = Math.ceil(((1 - Number(tokens)) / ratePerSec) * 1000);
+      res.set("Retry-After", String(Math.ceil(retryMs / 1000)));
+      return res.status(429).json({ error: "rate limited" });
+    } catch {
+      metrics.increment("limiter_degraded");
+      return next(); // fail open, backed by a local fallback bucket
+    }
+  };
+}`,
+        },
+        {
+          title: "In-process fallback bucket for Redis outages",
+          language: "typescript",
+          code: `type Bucket = { tokens: number; ts: number };
+const local = new Map<string, Bucket>();
+
+export function localAllow(key: string, capacity: number, ratePerSec: number): boolean {
+  const now = Date.now();
+  const b = local.get(key) ?? { tokens: capacity, ts: now };
+  b.tokens = Math.min(capacity, b.tokens + ((now - b.ts) / 1000) * ratePerSec);
+  b.ts = now;
+  if (b.tokens < 1) {
+    local.set(key, b);
+    return false;
+  }
+  b.tokens -= 1;
+  local.set(key, b);
+  if (local.size > 50_000) local.clear(); // crude memory cap for an MVP
+  return true;
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "news-feed",
@@ -380,6 +551,77 @@ export const caseStudies1: CaseStudy[] = [
       "Cursor pagination and async counter aggregation are small details that separate senior answers from junior ones.",
     ],
     relatedTopics: ["caching", "message-queues", "sharding-and-partitioning", "event-driven-architecture", "consistency-and-cap"],
+    rapidImplementation: {
+      stack: "Next.js + Postgres + Redis on one $12 VPS; BullMQ (Redis-backed) as the fan-out queue, no Kafka needed for an MVP",
+      steps: [
+        "Create tables: posts (id BIGSERIAL, author_id, text, created_at) and follows (follower_id, followee_id, PK on the pair, plus an index on followee_id).",
+        "Add a celebrity flag: is_celebrity boolean on users, set true above 10K followers by a nightly job (pick a low threshold so you can demo the hybrid path).",
+        "Build POST /api/posts: insert the post, then enqueue a BullMQ fanout job with { postId, authorId } and return immediately.",
+        "Write the fan-out worker: skip if the author is a celebrity, else page through follower ids 1000 at a time and LPUSH the post id into feed:{followerId}, LTRIM to 300.",
+        "Build GET /api/feed: LRANGE the viewer's feed:{userId} list, pull recent post ids from celebrities the viewer follows via one SQL query, merge by created_at.",
+        "Hydrate the merged id list with one SELECT ... WHERE id = ANY($1) and return posts sorted desc with a (created_at, id) cursor for pagination.",
+        "Union the viewer's own posts from the last minute into the response so users always see their own post instantly (read-your-writes).",
+        "Seed 10K fake users and 100K follows with a script, then verify a celebrity post appears in feeds without any fan-out writes.",
+      ],
+      codeSketches: [
+        {
+          title: "Fan-out-on-write worker (skips celebrities)",
+          language: "typescript",
+          code: `import { Worker } from "bullmq";
+
+new Worker("fanout", async (job) => {
+  const { postId, authorId } = job.data;
+  const author = await sql("SELECT is_celebrity FROM users WHERE id = $1", [authorId]);
+  if (author[0].is_celebrity) return; // pulled at read time instead
+
+  let cursor = 0;
+  for (;;) {
+    const followers = await sql(
+      "SELECT follower_id FROM follows WHERE followee_id = $1 AND follower_id > $2 ORDER BY follower_id LIMIT 1000",
+      [authorId, cursor]
+    );
+    if (followers.length === 0) break;
+    const pipe = redis.pipeline();
+    for (const f of followers) {
+      pipe.lpush("feed:" + f.follower_id, String(postId));
+      pipe.ltrim("feed:" + f.follower_id, 0, 299);
+    }
+    await pipe.exec();
+    cursor = followers[followers.length - 1].follower_id;
+  }
+}, { connection: redis });`,
+        },
+        {
+          title: "Hybrid feed read: cached push feed merged with celebrity pull",
+          language: "typescript",
+          code: `async function getFeed(userId: number, limit = 20) {
+  // 1. precomputed feed from fan-out on write
+  const pushedIds = (await redis.lrange("feed:" + userId, 0, 299)).map(Number);
+
+  // 2. pull recent posts from celebrities this user follows
+  const pulled = await sql(
+    "SELECT p.id FROM posts p " +
+    "JOIN follows f ON f.followee_id = p.author_id " +
+    "JOIN users u ON u.id = p.author_id " +
+    "WHERE f.follower_id = $1 AND u.is_celebrity " +
+    "AND p.created_at > now() - interval '48 hours' " +
+    "ORDER BY p.id DESC LIMIT 100",
+    [userId]
+  );
+
+  // 3. merge, dedup, hydrate (snowflake-style ids sort by time)
+  const ids = [...new Set([...pushedIds, ...pulled.map((r: any) => Number(r.id))])]
+    .sort((a, b) => b - a)
+    .slice(0, limit);
+  const posts = await sql(
+    "SELECT id, author_id, text, created_at FROM posts WHERE id = ANY($1)",
+    [ids]
+  );
+  return ids.map((id) => posts.find((p: any) => Number(p.id) === id));
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "chat-system",
@@ -517,6 +759,99 @@ export const caseStudies1: CaseStudy[] = [
       "Presence must be lazy and subscription-based; broadcasting status changes to all friends does not scale.",
     ],
     relatedTopics: ["realtime-communication", "message-queues", "sql-vs-nosql", "sharding-and-partitioning", "fault-tolerance"],
+    rapidImplementation: {
+      stack: "Node.js + ws (WebSocket) + Redis pub/sub + Postgres on a $12 VPS; two node processes behind nginx to prove cross-server routing",
+      steps: [
+        "Create tables: conversations (id, last_seq BIGINT DEFAULT 0), conversation_members (conversation_id, user_id, last_read_seq), messages (conversation_id, seq, client_msg_id UNIQUE, sender_id, content, created_at, PK (conversation_id, seq)).",
+        "Stand up a ws server that authenticates a JWT from the connection query string and keeps a Map of userId to socket set.",
+        "On each server, SUBSCRIBE to a Redis channel per connected user (chan:user:{id}); publish frames there so any server can reach any user.",
+        "Implement send: assign seq via UPDATE conversations SET last_seq = last_seq + 1 RETURNING last_seq, INSERT the message, ack the sender, then PUBLISH to every member's channel.",
+        "Make inserts idempotent with the UNIQUE index on client_msg_id: on conflict, re-ack with the existing seq instead of writing a duplicate.",
+        "Implement sync: on connect the client sends its last seq per conversation and the server returns SELECT ... WHERE seq > $cursor, which also covers offline delivery.",
+        "Add heartbeats: ping every 30s, terminate dead sockets, and SET presence:{userId} in Redis with a 60s TTL for online indicators.",
+        "Test by opening two browser tabs pinned to different node processes (nginx ip_hash off) and confirming both directions deliver under 100 ms.",
+      ],
+      codeSketches: [
+        {
+          title: "Send path: sequence, persist, then fan out via Redis pub/sub",
+          language: "typescript",
+          code: `async function handleSend(senderId: number, frame: any) {
+  const { conversationId, clientMsgId, content } = frame;
+  // atomic per-conversation sequence number
+  const seqRow = await sql(
+    "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
+    [conversationId]
+  );
+  const seq = Number(seqRow[0].last_seq);
+  try {
+    await sql(
+      "INSERT INTO messages (conversation_id, seq, client_msg_id, sender_id, content) VALUES ($1,$2,$3,$4,$5)",
+      [conversationId, seq, clientMsgId, senderId, content]
+    );
+  } catch (e: any) {
+    if (e.code !== "23505") throw e; // duplicate retry: fall through and re-ack
+  }
+  const members = await sql(
+    "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+    [conversationId]
+  );
+  const payload = JSON.stringify({ type: "msg", conversationId, seq, senderId, content });
+  for (const m of members) {
+    pub.publish("chan:user:" + m.user_id, payload); // reaches whichever server holds the socket
+  }
+  return { type: "ack", clientMsgId, seq };
+}`,
+        },
+        {
+          title: "Gateway: socket registry plus per-user Redis subscription",
+          language: "typescript",
+          code: `const sockets = new Map<number, Set<WebSocket>>(); // this server's connections
+
+wss.on("connection", async (ws, req) => {
+  const userId = verifyJwt(new URL(req.url!, "http://x").searchParams.get("token"));
+  if (!sockets.has(userId)) {
+    sockets.set(userId, new Set());
+    await sub.subscribe("chan:user:" + userId);
+  }
+  sockets.get(userId)!.add(ws);
+  ws.on("close", async () => {
+    const set = sockets.get(userId)!;
+    set.delete(ws);
+    if (set.size === 0) {
+      sockets.delete(userId);
+      await sub.unsubscribe("chan:user:" + userId);
+    }
+  });
+});
+
+sub.on("message", (channel: string, payload: string) => {
+  const userId = Number(channel.split(":")[2]);
+  for (const ws of sockets.get(userId) ?? []) ws.send(payload); // all devices
+});`,
+        },
+        {
+          title: "Client sync on reconnect: cursor fetch plus gap detection",
+          language: "typescript",
+          code: `const cursors = new Map<number, number>(); // conversationId -> highest seq seen
+
+async function onReconnect(ws: WebSocket) {
+  for (const [conversationId, seq] of cursors) {
+    ws.send(JSON.stringify({ type: "sync", conversationId, afterSeq: seq }));
+  }
+}
+
+function onMessageFrame(msg: { conversationId: number; seq: number }) {
+  const have = cursors.get(msg.conversationId) ?? 0;
+  if (msg.seq > have + 1) {
+    // gap: 4711 -> 4713 means 4712 was missed; fetch the range
+    send({ type: "sync", conversationId: msg.conversationId, afterSeq: have });
+  }
+  cursors.set(msg.conversationId, Math.max(have, msg.seq));
+  render(msg);
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "video-streaming",
@@ -659,6 +994,97 @@ export const caseStudies1: CaseStudy[] = [
       "At video scale, cost is architecture: CDN offload, per-title encoding, codec choice, and storage tiering are design decisions, not afterthoughts.",
     ],
     relatedTopics: ["cdn", "message-queues", "storage-and-search", "event-driven-architecture", "caching"],
+    rapidImplementation: {
+      stack: "Next.js + Postgres + BullMQ worker running ffmpeg, files on S3-compatible storage (Cloudflare R2, zero egress fees) served through Cloudflare CDN, hls.js player",
+      steps: [
+        "Create tables: videos (id, title, status DEFAULT 'uploading', duration_s, created_at) and renditions (video_id, name, bandwidth, playlist_path).",
+        "Build POST /api/videos to insert a row and return a pre-signed R2 multipart PUT URL so the browser uploads the source file directly to storage.",
+        "On the upload-complete callback, flip status to 'processing' and enqueue a BullMQ transcode job with the videoId.",
+        "In the worker, download the source and run ffmpeg once per rendition (start with 480p and 720p) producing HLS segments and a per-rendition .m3u8.",
+        "Generate a master.m3u8 listing both renditions with BANDWIDTH and RESOLUTION attributes, upload all output under videos/{id}/ in R2, set status 'live'.",
+        "Serve playback with hls.js pointed at the CDN URL of master.m3u8; the player handles rendition switching for free.",
+        "Set Cache-Control: public, max-age=31536000, immutable on segments (they never change) and a short max-age on playlists.",
+        "Count views by POSTing a beacon at 10s of playback into a view_events table; roll up per-video counts with a minutely cron, never increment synchronously.",
+      ],
+      codeSketches: [
+        {
+          title: "Transcode worker: ffmpeg per rendition to HLS",
+          language: "typescript",
+          code: `import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+const run = promisify(execFile);
+
+const LADDER = [
+  { name: "480p", height: 480, vBitrate: "1200k", bandwidth: 1400000 },
+  { name: "720p", height: 720, vBitrate: "2800k", bandwidth: 3200000 },
+];
+
+async function transcode(videoId: string, srcPath: string, outDir: string) {
+  for (const r of LADDER) {
+    await run("ffmpeg", [
+      "-i", srcPath,
+      "-vf", "scale=-2:" + r.height,
+      "-c:v", "libx264", "-b:v", r.vBitrate, "-preset", "fast",
+      "-c:a", "aac", "-b:a", "128k",
+      "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", // aligned keyframes
+      "-hls_time", "6", "-hls_playlist_type", "vod",
+      "-hls_segment_filename", outDir + "/" + r.name + "_%04d.ts",
+      outDir + "/" + r.name + ".m3u8",
+    ]);
+  }
+}`,
+        },
+        {
+          title: "Master HLS playlist generation",
+          language: "typescript",
+          code: `function buildMasterPlaylist(renditions: { name: string; bandwidth: number; height: number }[]): string {
+  const lines = ["#EXTM3U", "#EXT-X-VERSION:3"];
+  for (const r of renditions) {
+    const width = Math.round((r.height * 16) / 9);
+    lines.push(
+      "#EXT-X-STREAM-INF:BANDWIDTH=" + r.bandwidth +
+      ",RESOLUTION=" + width + "x" + r.height
+    );
+    lines.push(r.name + ".m3u8");
+  }
+  return lines.join("\\n") + "\\n";
+}
+
+// after transcoding, publish everything and go live
+async function publish(videoId: string, outDir: string) {
+  await uploadDir(outDir, "videos/" + videoId + "/"); // R2 put per file
+  await sql("UPDATE videos SET status = 'live' WHERE id = $1", [videoId]);
+}`,
+        },
+        {
+          title: "Pre-signed direct-to-storage upload init",
+          language: "typescript",
+          code: `import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: { accessKeyId: process.env.R2_KEY!, secretAccessKey: process.env.R2_SECRET! },
+});
+
+export async function POST(req: Request) {
+  const { title, contentType } = await req.json();
+  const rows = await sql(
+    "INSERT INTO videos (title, status) VALUES ($1, 'uploading') RETURNING id",
+    [title]
+  );
+  const videoId = rows[0].id;
+  const uploadUrl = await getSignedUrl(
+    r2,
+    new PutObjectCommand({ Bucket: "videos", Key: "sources/" + videoId, ContentType: contentType }),
+    { expiresIn: 3600 }
+  );
+  return Response.json({ videoId, uploadUrl }); // browser PUTs the file itself
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "web-crawler",
@@ -788,5 +1214,115 @@ export const caseStudies1: CaseStudy[] = [
       "Shard by hostname so politeness state stays node-local, and treat recrawl as a continuous scheduling problem driven by estimated change rates.",
     ],
     relatedTopics: ["probabilistic-data-structures", "message-queues", "dns", "consistent-hashing", "storage-and-search"],
+    rapidImplementation: {
+      stack: "Python 3.12 + asyncio + aiohttp + Redis (frontier and dedup) + SQLite for page metadata, gzip HTML to local disk; runs on a laptop or $6 VPS",
+      steps: [
+        "Model the frontier in Redis: one list frontier:{host} per host, a set of known hosts, and a sorted set host_ready scored by next_allowed_fetch_ms.",
+        "Write the URL canonicalizer: lowercase scheme and host, strip fragments and default ports, drop tracking params (utm_*, fbclid), resolve relative paths.",
+        "Add dedup: a Bloom filter (pybloom-live, 50M capacity, 1% FP) checked before enqueue, with an INSERT OR IGNORE into a SQLite urls table as the authoritative record.",
+        "Implement the politeness scheduler: pop the lowest-scored ready host from host_ready, take one URL from its list, and re-score the host to now + delay after the fetch completes.",
+        "Fetch with aiohttp using a 10s timeout, 2 MB size cap, and a descriptive User-Agent; on 429/5xx double the host's delay, on success decay it back toward 1s.",
+        "Cache robots.txt per host in Redis for 24h using urllib.robotparser and drop disallowed URLs at enqueue time.",
+        "Parse with BeautifulSoup, extract and canonicalize hrefs, cap path depth at 8 and pages per domain at 5000 to dodge spider traps.",
+        "Store gzipped HTML keyed by sha256(url) and record status, checksum, and fetch time in SQLite; seed with 10 URLs and watch it hold roughly 1 req/sec/host.",
+      ],
+      codeSketches: [
+        {
+          title: "Frontier with per-host politeness delay",
+          language: "python",
+          code: `import time
+
+DEFAULT_DELAY_MS = 1000
+
+async def get_next_url(redis):
+    # host_ready: sorted set of host -> next_allowed_fetch_ms
+    now_ms = int(time.time() * 1000)
+    ready = await redis.zrangebyscore("host_ready", 0, now_ms, start=0, num=1)
+    if not ready:
+        return None  # no host is polite to fetch yet; caller sleeps briefly
+    host = ready[0]
+    url = await redis.lpop("frontier:" + host)
+    if url is None:
+        await redis.zrem("host_ready", host)  # queue drained
+        return None
+    # block this host until its delay elapses; adjusted again on response
+    delay = int(await redis.hget("host_delay", host) or DEFAULT_DELAY_MS)
+    await redis.zadd("host_ready", {host: now_ms + delay})
+    return url
+
+async def report_result(redis, host, status, elapsed_ms):
+    delay = int(await redis.hget("host_delay", host) or DEFAULT_DELAY_MS)
+    if status in (429, 503):
+        delay = min(delay * 2, 60_000)      # back off hard
+    else:
+        delay = max(1000, int(delay * 0.9), elapsed_ms * 3)  # adaptive politeness
+    await redis.hset("host_delay", host, delay)`,
+        },
+        {
+          title: "Canonicalize then dedup with a Bloom filter",
+          language: "python",
+          code: `from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from pybloom_live import ScalableBloomFilter
+
+seen = ScalableBloomFilter(initial_capacity=50_000_000, error_rate=0.01)
+TRACKING = {"fbclid", "gclid", "ref"}
+
+def canonicalize(url: str) -> str | None:
+    s = urlsplit(url)
+    if s.scheme not in ("http", "https"):
+        return None
+    host = s.hostname.lower() if s.hostname else None
+    if not host or s.path.count("/") > 8:
+        return None  # depth cap against calendar-style traps
+    query = urlencode(sorted(
+        (k, v) for k, v in parse_qsl(s.query)
+        if not k.startswith("utm_") and k not in TRACKING
+    ))
+    return urlunsplit((s.scheme, host, s.path or "/", query, ""))
+
+def enqueue_if_new(db, redis_pipe, url: str):
+    canon = canonicalize(url)
+    if canon is None or canon in seen:
+        return  # Bloom filter: ~10 bits/URL vs storing full strings
+    seen.add(canon)
+    # authoritative store confirms; INSERT OR IGNORE handles FP double-checks
+    db.execute("INSERT OR IGNORE INTO urls (url, status) VALUES (?, 'queued')", (canon,))
+    host = urlsplit(canon).hostname
+    redis_pipe.rpush("frontier:" + host, canon)
+    redis_pipe.zadd("host_ready", {host: 0}, nx=True)`,
+        },
+        {
+          title: "Async fetch worker loop",
+          language: "python",
+          code: `import asyncio, gzip, hashlib, time
+import aiohttp
+
+UA = "MiniCrawler/0.1 (+mailto:you@example.com)"
+
+async def worker(redis, db, session: aiohttp.ClientSession):
+    while True:
+        url = await get_next_url(redis)
+        if url is None:
+            await asyncio.sleep(0.05)
+            continue
+        host = aiohttp.helpers.URL(url).host
+        if not await robots_allows(redis, session, host, url):
+            continue
+        start = time.monotonic()
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10),
+                                   headers={"User-Agent": UA}) as resp:
+                body = await resp.content.read(2_000_000)  # 2 MB cap
+                elapsed = int((time.monotonic() - start) * 1000)
+                await report_result(redis, host, resp.status, elapsed)
+                if resp.status == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+                    key = hashlib.sha256(url.encode()).hexdigest()
+                    open("pages/" + key + ".html.gz", "wb").write(gzip.compress(body))
+                    await parse_and_enqueue(redis, db, url, body)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await report_result(redis, host, 503, 10_000)`,
+        },
+      ],
+    },
   },
 ];

@@ -20,7 +20,7 @@ export const metadata: Metadata = {
     template: "%s | System Design Prep",
   },
   description:
-    "Every core system design concept, 12 classic interview case studies, a back-of-envelope calculator, flashcards, and a step-by-step interview framework.",
+    "Every core system design concept, 28 classic interview case studies with rapid MVP implementation guides, a back-of-envelope calculator, flashcards, and a step-by-step interview framework.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

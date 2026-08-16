@@ -15,7 +15,7 @@ const features = [
     href: "/case-studies",
     title: "Case Studies",
     description:
-      "Classic interview questions solved end to end - requirements, estimation, APIs, data model, deep dives.",
+      "Classic interview questions solved end to end - requirements, estimation, APIs, deep dives, and a rapid MVP build with real code.",
   },
   {
     href: "/framework",

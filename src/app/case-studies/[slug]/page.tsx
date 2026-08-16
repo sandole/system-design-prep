@@ -162,6 +162,52 @@ export default async function CaseStudyPage(
         </div>
       </section>
 
+      <section className="mb-10">
+        <SectionHeading step={7} title="Rapid implementation: build the MVP" />
+        <p className="mb-4 text-sm text-slate-400">
+          Theory is table stakes. Here is how you would stand up a working
+          version fast, on a budget, with the core algorithm in real code.
+        </p>
+        <div className="mb-5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
+          <p className="text-xs font-semibold uppercase tracking-wide text-emerald-400">
+            Stack
+          </p>
+          <p className="mt-1 font-mono text-sm text-slate-200">
+            {study.rapidImplementation.stack}
+          </p>
+        </div>
+        <ol className="mb-6 space-y-2">
+          {study.rapidImplementation.steps.map((s, i) => (
+            <li key={s} className="flex gap-3 text-sm leading-relaxed text-slate-300">
+              <span className="shrink-0 font-mono text-emerald-400">
+                {String(i + 1).padStart(2, "0")}
+              </span>
+              {s}
+            </li>
+          ))}
+        </ol>
+        <div className="space-y-4">
+          {study.rapidImplementation.codeSketches.map((sketch) => (
+            <div
+              key={sketch.title}
+              className="overflow-hidden rounded-xl border border-slate-800"
+            >
+              <div className="flex items-center justify-between border-b border-slate-800 bg-slate-900 px-4 py-2">
+                <p className="text-sm font-medium text-slate-200">
+                  {sketch.title}
+                </p>
+                <span className="font-mono text-xs text-slate-500">
+                  {sketch.language}
+                </span>
+              </div>
+              <pre className="overflow-x-auto bg-[#0a0f1c] p-4 text-xs leading-relaxed text-slate-300">
+                <code>{sketch.code}</code>
+              </pre>
+            </div>
+          ))}
+        </div>
+      </section>
+
       <section className="mb-10 rounded-xl border border-rose-500/30 bg-rose-500/5 p-6">
         <h2 className="mb-3 text-lg font-semibold text-rose-300">
           Bottlenecks & failure modes

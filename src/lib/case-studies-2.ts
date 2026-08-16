@@ -127,6 +127,74 @@ export const caseStudies2: CaseStudy[] = [
       "storage-and-search",
       "probabilistic-data-structures",
     ],
+    rapidImplementation: {
+      stack:
+        "Node.js + Fastify, one Redis instance for prefix buckets, and a nightly cron for score decay, all on a single $12/mo VPS.",
+      steps: [
+        "Scaffold a Fastify server with GET /suggest?q= and an internal POST /queries hook that fires whenever a search is actually submitted.",
+        "Write the ingester: for each prefix (up to 20 chars) of a submitted query, ZINCRBY the query in that prefix's Redis sorted set, then trim the set to its top 50 members to bound memory.",
+        "Implement /suggest as a single ZREVRANGE on the prefix's sorted set, returning the top 10 as JSON.",
+        "Seed the corpus with a bulk import script from a public query log (e.g., AOL dataset) or your own site's search history.",
+        "Add a frontend input with a 75ms debounce that calls /suggest per settled keystroke and renders the dropdown.",
+        "Add a Redis SET blocklist checked at ingest time so banned terms never enter a bucket.",
+        "Add a nightly cron that walks all buckets and multiplies scores by 0.9 (ZUNIONSTORE with a weight) so stale queries decay.",
+        "Load test hot prefixes with autocannon and confirm p99 stays under 20ms.",
+      ],
+      codeSketches: [
+        {
+          title: "Redis ZSET prefix buckets: ingest and lookup",
+          language: "typescript",
+          code: `import Redis from "ioredis";
+const redis = new Redis();
+const MAX_PREFIX = 20;
+const BUCKET_SIZE = 50;
+
+export async function recordQuery(raw: string) {
+  const q = raw.trim().toLowerCase();
+  if (!q || (await redis.sismember("blocklist", q))) return;
+  for (let i = 1; i <= Math.min(q.length, MAX_PREFIX); i++) {
+    const key = "sug:" + q.slice(0, i);
+    await redis.zincrby(key, 1, q);
+    // keep only the best N per bucket so memory stays bounded
+    await redis.zremrangebyrank(key, 0, -(BUCKET_SIZE + 1));
+  }
+}
+
+export async function suggest(prefix: string, limit = 10) {
+  const key = "sug:" + prefix.trim().toLowerCase();
+  return redis.zrevrange(key, 0, limit - 1); // O(log n + limit)
+}`,
+        },
+        {
+          title: "In-memory trie with precomputed top-k per node",
+          language: "python",
+          code: `class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.top_k = []  # (score, query) pairs, best first, max 10
+
+def build_trie(query_scores):
+    root = TrieNode()
+    for query, score in query_scores.items():
+        node = root
+        for ch in query:
+            node = node.children.setdefault(ch, TrieNode())
+            # maintain the top-k list at every ancestor node
+            node.top_k.append((score, query))
+            node.top_k.sort(reverse=True)
+            del node.top_k[10:]
+    return root
+
+def suggest(root, prefix):
+    node = root
+    for ch in prefix.strip().lower():
+        if ch not in node.children:
+            return []
+        node = node.children[ch]
+    return [q for _, q in node.top_k]  # O(len(prefix)) total`,
+        },
+      ],
+    },
   },
   {
     slug: "notification-system",
@@ -265,6 +333,79 @@ export const caseStudies2: CaseStudy[] = [
       "fault-tolerance",
       "api-design",
     ],
+    rapidImplementation: {
+      stack:
+        "Node.js + Postgres as a transactional outbox, Redis for rate caps, Expo push + Resend email in free tiers, one Fly.io machine.",
+      steps: [
+        "Create Postgres tables outbox and user_preferences; the unique index on idempotency_key is your producer-side dedup.",
+        "Build POST /notifications: INSERT into outbox with ON CONFLICT (idempotency_key) DO NOTHING and return 202 with the row id either way.",
+        "Write the worker loop: every second, claim a batch of due rows with FOR UPDATE SKIP LOCKED so concurrent workers never grab the same row.",
+        "In the worker, check the user's opt-outs and quiet hours, then apply a per-user daily marketing cap via a Redis counter with a 24h TTL.",
+        "Wire two providers behind a common send(userId, payload) interface: Expo for push, Resend for email; add SMS later only if you must pay for it.",
+        "On provider failure, bump attempts and push send_after forward with exponential backoff; after 5 attempts mark the row dead for inspection.",
+        "Expose GET /notifications/:id/status reading straight off the outbox row, and a webhook endpoint that records provider delivery receipts.",
+      ],
+      codeSketches: [
+        {
+          title: "Outbox table and atomic batch claim",
+          language: "sql",
+          code: `CREATE TABLE outbox (
+  id BIGSERIAL PRIMARY KEY,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  user_id BIGINT NOT NULL,
+  channel TEXT NOT NULL,          -- 'push' | 'email' | 'sms'
+  category TEXT NOT NULL,         -- 'transactional' | 'marketing'
+  payload JSONB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  attempts INT NOT NULL DEFAULT 0,
+  send_after TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ON outbox (status, send_after);
+
+-- Worker claims a batch atomically; SKIP LOCKED means
+-- concurrent workers never double-send the same row.
+UPDATE outbox SET status = 'sending', attempts = attempts + 1
+WHERE id IN (
+  SELECT id FROM outbox
+  WHERE status = 'queued' AND send_after <= now()
+  ORDER BY id LIMIT 100
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING *;`,
+        },
+        {
+          title: "Worker with per-user rate cap and backoff",
+          language: "typescript",
+          code: `const DAILY_MARKETING_CAP = 5;
+
+async function processBatch(rows: OutboxRow[]) {
+  for (const row of rows) {
+    // transactional messages (OTP, receipts) are exempt from caps
+    if (row.category === "marketing") {
+      const key = "cap:" + row.user_id + ":" + isoDate();
+      const n = await redis.incr(key);
+      if (n === 1) await redis.expire(key, 86400);
+      if (n > DAILY_MARKETING_CAP) {
+        await setStatus(row.id, "suppressed");
+        continue;
+      }
+    }
+    try {
+      await providers[row.channel].send(row.user_id, row.payload);
+      await setStatus(row.id, "sent");
+    } catch {
+      if (row.attempts >= 5) {
+        await setStatus(row.id, "dead"); // poison row, inspect later
+      } else {
+        const delayMs = Math.min(2 ** row.attempts * 1000, 3600_000);
+        await requeue(row.id, delayMs); // status back to queued
+      }
+    }
+  }
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "ride-sharing",
@@ -407,6 +548,85 @@ export const caseStudies2: CaseStudy[] = [
       "sharding-and-partitioning",
       "event-driven-architecture",
     ],
+    rapidImplementation: {
+      stack:
+        "Node.js + Socket.IO for live connections, Redis hashes keyed by geohash cell, Postgres for trips, haversine ranking (OSRM later), one Hetzner VM.",
+      steps: [
+        "Scaffold Express + Socket.IO with separate driver and rider namespaces; the driver app emits {lat, lng} every 4 seconds.",
+        "Store live locations in geohash-6 cell hashes in Redis with a 15s freshness window, plus a driver-to-cell reverse key so cell moves are a cheap two-key update.",
+        "Create a Postgres trips table with a status state machine: requested, matching, matched, in_progress, completed, cancelled.",
+        "Build POST /rides: quote fare as distance x rate x surge, insert the trip in 'matching', then query the pickup's cell plus its 8 neighbors for candidate drivers.",
+        "Rank candidates by haversine distance for the MVP, push an offer with a 10s TTL to the top driver's socket, and cascade to the next on decline or timeout.",
+        "Implement accept as a conditional UPDATE ... WHERE status = 'matching'; zero rows updated means someone else won, so tell the driver it is taken.",
+        "During the trip, relay the driver's position to the rider's socket and mark completion, computing the final fare from the frozen quote.",
+        "Surge MVP: a per-cell counter of open requests vs. available drivers per minute; multiplier = clamp(requests / max(drivers, 1), 1, 3), frozen into the quote.",
+      ],
+      codeSketches: [
+        {
+          title: "Geohash bucket index: update and neighbor query",
+          language: "typescript",
+          code: `import geohash from "ngeohash";
+
+const PRECISION = 6; // roughly 1.2km x 0.6km cells
+const FRESH_MS = 15_000;
+
+export async function updateDriver(id: string, lat: number, lng: number) {
+  const cell = geohash.encode(lat, lng, PRECISION);
+  const prev = await redis.getset("drv:" + id, cell);
+  if (prev && prev !== cell) await redis.hdel("cell:" + prev, id);
+  await redis.hset(
+    "cell:" + cell, id,
+    JSON.stringify({ lat, lng, t: Date.now() })
+  );
+  await redis.expire("drv:" + id, 15); // dead apps vanish from matching
+}
+
+export async function nearbyDrivers(lat: number, lng: number) {
+  const center = geohash.encode(lat, lng, PRECISION);
+  const cells = [center, ...geohash.neighbors(center)]; // avoid edge misses
+  const out: Array<{ id: string; lat: number; lng: number }> = [];
+  for (const c of cells) {
+    const members = await redis.hgetall("cell:" + c);
+    for (const [id, raw] of Object.entries(members)) {
+      const p = JSON.parse(raw);
+      if (Date.now() - p.t < FRESH_MS) out.push({ id, lat: p.lat, lng: p.lng });
+    }
+  }
+  return out;
+}`,
+        },
+        {
+          title: "Nearest-driver ranking and atomic dispatch accept",
+          language: "typescript",
+          code: `function haversineKm(a: Pt, b: Pt) {
+  const R = 6371, d = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * d, dLng = (b.lng - a.lng) * d;
+  const h = Math.sin(dLat / 2) ** 2 +
+    Math.cos(a.lat * d) * Math.cos(b.lat * d) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+export async function matchRide(tripId: number, pickup: Pt) {
+  const candidates = (await nearbyDrivers(pickup.lat, pickup.lng))
+    .map((c) => ({ ...c, dist: haversineKm(pickup, c) }))
+    .sort((x, y) => x.dist - y.dist)
+    .slice(0, 5);
+  for (const c of candidates) {
+    const accepted = await offerWithTtl(c.id, tripId, 10_000);
+    if (!accepted) continue; // decline or timeout: next candidate
+    // atomic compare-and-set is the double-dispatch guardrail
+    const res = await pool.query(
+      "UPDATE trips SET status = 'matched', driver_id = $1 " +
+      "WHERE id = $2 AND status = 'matching'",
+      [c.id, tripId]
+    );
+    if (res.rowCount === 1) return c.id; // this accept won
+  }
+  return null; // no driver found; widen the search ring
+}`,
+        },
+      ],
+    },
   },
   {
     slug: "key-value-store",
@@ -543,6 +763,85 @@ export const caseStudies2: CaseStudy[] = [
       "fault-tolerance",
       "sharding-and-partitioning",
     ],
+    rapidImplementation: {
+      stack:
+        "Python + FastAPI nodes talking plain HTTP to each other, SQLite per node for storage, 3 processes via docker-compose on one laptop.",
+      steps: [
+        "Write the consistent-hash Ring class with ~100 vnodes per node; unit test that removing a node remaps only about 1/N of 10K sample keys.",
+        "Build a FastAPI node exposing internal GET/PUT /local/{key} backed by a SQLite table (key, value, version).",
+        "Add coordinator logic: any node computes the preference list for a key and fans the PUT to N=3 replicas, acking the client after W=2 responses.",
+        "Implement quorum GET: read from R=2 replicas, return the highest version, and write it back to any stale replica (read repair).",
+        "Bring up 3 nodes with docker-compose, kill one, and verify reads and writes still succeed at R=W=2.",
+        "Add hinted handoff: when a replica is down, write to the next healthy ring node with a hint row, and replay hints on a background timer.",
+        "Add GET /admin/ring showing token ownership and a smoke script that writes 10K keys and checks the distribution is roughly even.",
+      ],
+      codeSketches: [
+        {
+          title: "Consistent-hash ring with virtual nodes",
+          language: "python",
+          code: `import hashlib
+from bisect import bisect_right
+
+class Ring:
+    def __init__(self, nodes, vnodes=100):
+        self.tokens = []  # sorted (hash, node) pairs
+        for node in nodes:
+            for i in range(vnodes):
+                self.tokens.append((self._hash(node + ":" + str(i)), node))
+        self.tokens.sort()
+
+    @staticmethod
+    def _hash(s):
+        return int(hashlib.md5(s.encode()).hexdigest(), 16)
+
+    def preference_list(self, key, n=3):
+        idx = bisect_right(self.tokens, (self._hash(key), chr(0)))
+        picked = []
+        for i in range(len(self.tokens)):
+            node = self.tokens[(idx + i) % len(self.tokens)][1]
+            if node not in picked:  # skip vnodes of already-chosen hosts
+                picked.append(node)
+            if len(picked) == n:
+                break
+        return picked`,
+        },
+        {
+          title: "Quorum read with read repair",
+          language: "python",
+          code: `async def quorum_get(ring, key, r=2, n=3):
+    replies = []
+    for node in ring.preference_list(key, n):
+        try:
+            # each reply: {"value": ..., "version": int}
+            replies.append((node, await http_get(node, key)))
+        except Exception:
+            continue  # dead replica, try the next one
+        if len(replies) >= r:
+            break
+    if len(replies) < r:
+        raise QuorumError("read quorum failed: " + str(len(replies)))
+    newest = max(replies, key=lambda p: p[1]["version"])[1]
+    for node, reply in replies:
+        if reply["version"] < newest["version"]:
+            # read repair: push the winner back to stale replicas
+            await http_put(node, key, newest)
+    return newest
+
+async def quorum_put(ring, key, value, version, w=2, n=3):
+    item = {"value": value, "version": version + 1}
+    acks = 0
+    for node in ring.preference_list(key, n):
+        try:
+            await http_put(node, key, item)
+            acks += 1
+        except Exception:
+            continue
+    if acks < w:
+        raise QuorumError("write quorum failed")
+    return item`,
+        },
+      ],
+    },
   },
   {
     slug: "cloud-storage",
@@ -685,6 +984,79 @@ export const caseStudies2: CaseStudy[] = [
       "replication",
       "message-queues",
     ],
+    rapidImplementation: {
+      stack:
+        "Python + FastAPI for metadata, SQLite for the metadata tables, MinIO (free, S3-compatible) as the block store, watchdog for the client folder watcher, all on one machine.",
+      steps: [
+        "Run MinIO locally with a chunks bucket; create SQLite tables files, file_versions, version_chunks, and chunks.",
+        "Write the client chunker: fixed 4 MB blocks, SHA-256 each, producing an ordered hash manifest per file.",
+        "Build POST /files/precommit that returns which manifest hashes the server does not yet have, and PUT /chunks/{hash} that stores a block in MinIO keyed by its hash.",
+        "Build POST /files/commit that inserts the version row and manifest atomically, conditional on the parent version still being head; reject stale parents.",
+        "Write the client sync loop: watchdog detects a changed file, re-chunk it, upload only the missing hashes, then commit.",
+        "Implement download as the mirror image: fetch the manifest, pull only chunks absent from the local chunk cache, reassemble in order.",
+        "Handle commit rejection by saving the local file as 'name (conflicted copy)' and committing it as a new file.",
+        "Verify dedup end to end: copy a 1 GB file to a second name and confirm the second upload transfers zero chunks.",
+      ],
+      codeSketches: [
+        {
+          title: "Client: fixed-size chunking and dedup upload",
+          language: "python",
+          code: `import hashlib
+
+CHUNK = 4 * 1024 * 1024  # 4 MB fixed blocks
+
+def chunk_manifest(path):
+    hashes = []
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(CHUNK)
+            if not block:
+                break
+            hashes.append(hashlib.sha256(block).hexdigest())
+    return hashes
+
+def sync_file(api, path, parent_version):
+    manifest = chunk_manifest(path)
+    # server answers with only the hashes it has never seen
+    missing = set(api.post("/files/precommit", hashes=manifest))
+    with open(path, "rb") as f:
+        for seq, h in enumerate(manifest):
+            if h not in missing:
+                continue  # dedup: server already has this block
+            f.seek(seq * CHUNK)
+            api.put_chunk(h, f.read(CHUNK))  # content-addressed PUT
+    # blocks are durable first; metadata commit comes second
+    return api.post("/files/commit", path=path,
+                    hashes=manifest, parent_version=parent_version)`,
+        },
+        {
+          title: "Server: dedup check and optimistic-concurrency commit",
+          language: "sql",
+          code: `-- precommit: which of the client's hashes are new to us?
+SELECT h.hash
+FROM unnest($1::text[]) AS h(hash)
+WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.hash = h.hash);
+
+-- commit: one transaction, conditional on parent still being head
+BEGIN;
+INSERT INTO file_versions (file_id, version, file_hash)
+SELECT $1, $2 + 1, $3
+WHERE COALESCE(
+  (SELECT MAX(version) FROM file_versions WHERE file_id = $1), 0
+) = $2;
+-- 0 rows inserted: another device committed first, so the client
+-- must create a conflicted copy instead of overwriting head.
+
+INSERT INTO version_chunks (version_id, seq, chunk_hash)
+SELECT currval('file_versions_id_seq'), s.ord - 1, s.hash
+FROM unnest($4::text[]) WITH ORDINALITY AS s(hash, ord);
+
+INSERT INTO journal (namespace_id, file_id, op)
+VALUES ($5, $1, 'commit');
+COMMIT;`,
+        },
+      ],
+    },
   },
   {
     slug: "payment-system",
@@ -828,5 +1200,79 @@ export const caseStudies2: CaseStudy[] = [
       "security",
       "observability",
     ],
+    rapidImplementation: {
+      stack:
+        "Node.js + Express, Postgres for payments and the ledger, Stripe in test mode (no real money), deployed on a Render free-tier instance.",
+      steps: [
+        "Create Postgres tables payments, idempotency_keys, ledger_transactions, and ledger_entries; every amount is an integer in minor units (cents).",
+        "Write the idempotency middleware and mount it on POST /payments and POST /refunds; require the Idempotency-Key header.",
+        "Integrate Stripe test mode: create and confirm a PaymentIntent server-side, passing the same idempotency key through to Stripe.",
+        "On confirmed success, post the balanced double-entry ledger transaction (receivable debit, merchant payable and fee credits) in one DB transaction, then store the response against the idempotency key.",
+        "Add the webhook endpoint: verify the Stripe signature, insert the event with a unique event_id (duplicates no-op), and advance the payment state machine only along legal transitions.",
+        "Add a sweeper cron that finds payments stuck in pending for over 10 minutes, queries Stripe for the intent's real status, and resumes the state machine; never guess.",
+        "Write a nightly reconciliation script that pulls Stripe balance transactions and diffs them against the ledger, printing every mismatch.",
+        "Test with Stripe CLI webhook replays and duplicate POSTs to prove the same key never charges twice.",
+      ],
+      codeSketches: [
+        {
+          title: "Idempotency-key middleware",
+          language: "typescript",
+          code: `export function idempotency(pool: Pool) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const key = req.header("Idempotency-Key");
+    if (!key) {
+      return res.status(400).json({ error: "Idempotency-Key required" });
+    }
+    // atomic claim: unique constraint decides who runs the handler
+    const claim = await pool.query(
+      "INSERT INTO idempotency_keys (key, status) " +
+      "VALUES ($1, 'in_progress') ON CONFLICT (key) DO NOTHING " +
+      "RETURNING key",
+      [key]
+    );
+    if (claim.rowCount === 1) {
+      res.locals.idemKey = key; // handler stores its response under this
+      return next();
+    }
+    const prior = await pool.query(
+      "SELECT status, response FROM idempotency_keys WHERE key = $1",
+      [key]
+    );
+    if (prior.rows[0].status === "in_progress") {
+      // original attempt still running: report it, never re-execute
+      return res.status(409).json({ error: "request already in progress" });
+    }
+    return res.status(200).json(prior.rows[0].response); // replay outcome
+  };
+}`,
+        },
+        {
+          title: "Double-entry ledger posting in one transaction",
+          language: "sql",
+          code: `-- A $50.00 capture: all rows commit together or not at all.
+BEGIN;
+
+INSERT INTO ledger_transactions (id, type, payment_id, external_ref)
+VALUES (11, 'capture', 42, 'pi_3XyzStripeIntentId');
+
+-- balanced postings in integer cents: debits equal credits
+INSERT INTO ledger_entries
+  (transaction_id, account_id, direction, amount_minor) VALUES
+  (11, 1001, 'D', 5000),  -- psp_receivable
+  (11, 2042, 'C', 4825),  -- merchant_payable (merchant 42)
+  (11, 3001, 'C', 175);   -- platform_fee_revenue
+
+-- invariant check: divide by zero aborts the whole transaction
+-- if debits and credits do not net to zero
+SELECT 1 / CASE WHEN COALESCE(SUM(
+  CASE direction WHEN 'D' THEN amount_minor ELSE -amount_minor END
+), -1) = 0 THEN 1 ELSE 0 END
+FROM ledger_entries WHERE transaction_id = 11;
+
+COMMIT;
+-- corrections are new reversing entries; rows are never updated`,
+        },
+      ],
+    },
   },
 ];
