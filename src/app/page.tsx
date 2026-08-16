@@ -15,7 +15,7 @@ const features = [
     href: "/case-studies",
     title: "Case Studies",
     description:
-      "Classic interview questions solved end to end — requirements, estimation, APIs, data model, deep dives.",
+      "Classic interview questions solved end to end - requirements, estimation, APIs, data model, deep dives.",
   },
   {
     href: "/framework",
@@ -63,7 +63,7 @@ export default function Home() {
         </h1>
         <p className="mx-auto mt-5 max-w-2xl text-lg text-slate-400">
           Concept deep dives, fully worked case studies, estimation tools, and
-          drills — in one place, with the tradeoff-driven thinking interviewers
+          drills - in one place, with the tradeoff-driven thinking interviewers
           actually look for.
         </p>
         <div className="mt-8 flex flex-wrap justify-center gap-3">

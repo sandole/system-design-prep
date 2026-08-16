@@ -10,7 +10,7 @@ export const metadata: Metadata = {
 const steps = [
   {
     title: "Understand the problem & scope it",
-    time: "5–10 min",
+    time: "5-10 min",
     color: "border-sky-500/40 bg-sky-500/5",
     accent: "text-sky-400",
     points: [
@@ -24,7 +24,7 @@ const steps = [
   },
   {
     title: "Back-of-envelope estimation",
-    time: "3–5 min",
+    time: "3-5 min",
     color: "border-emerald-500/40 bg-emerald-500/5",
     accent: "text-emerald-400",
     points: [
@@ -38,7 +38,7 @@ const steps = [
   },
   {
     title: "High-level design",
-    time: "10–15 min",
+    time: "10-15 min",
     color: "border-amber-500/40 bg-amber-500/5",
     accent: "text-amber-400",
     points: [
@@ -53,7 +53,7 @@ const steps = [
   },
   {
     title: "Deep dives & wrap-up",
-    time: "10–15 min",
+    time: "10-15 min",
     color: "border-rose-500/40 bg-rose-500/5",
     accent: "text-rose-400",
     points: [
